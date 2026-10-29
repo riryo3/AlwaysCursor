@@ -98,6 +98,10 @@ final class Profile {
 final class ArrowView: NSView {
     var profile = Profile() { didSet { applyBlur(); needsDisplay = true } }
     var circle = false { didSet { needsDisplay = true } }
+    // 本物そっくりモード: 本物のカーソルの画像をそのまま拡大して描く
+    var mirror = false { didSet { needsDisplay = true } }
+    var mirrorImage: NSImage? { didSet { needsDisplay = true } }
+    var mirrorHotSpot = NSPoint.zero
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -117,6 +121,18 @@ final class ArrowView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         let x = bounds.midX, y = bounds.midY
+        if mirror {
+            // 本物のカーソルの画像を、ホットスポットが中心に来るよう拡大して描く
+            if let img = mirrorImage {
+                let s = img.size
+                let w = s.width * profile.scale, h = s.height * profile.scale
+                let rect = NSRect(x: x - mirrorHotSpot.x * profile.scale,
+                                  y: y - (s.height - mirrorHotSpot.y) * profile.scale,
+                                  width: w, height: h)
+                img.draw(in: rect, from: NSRect(origin: .zero, size: s), operation: .sourceOver, fraction: 1)
+            }
+            return
+        }
         let K = K0 * profile.scale
         func pt(_ dx: CGFloat, _ dy: CGFloat) -> NSPoint { NSPoint(x: x + dx * K, y: y - dy * K) }
         let a: NSBezierPath
@@ -220,9 +236,10 @@ final class App: NSObject, NSApplicationDelegate {
     var smooth = CGFloat(Prefs.double("smooth", default: 0.4))         // 速度の平滑化(大きいほどなめらか)
     var stopDelay = Prefs.double("stopMs", default: 30) / 1000         // 動きが止まったとみなす時間
 
-    // 形ごとの設定。0 = 矢印、1 = 丸
-    let profiles = [Profile.load("profile.arrow"), Profile.load("profile.circle")]
-    var shape = UserDefaults.standard.bool(forKey: "circle") ? 1 : 0
+    // 形ごとの設定。0 = 矢印、1 = 丸、2 = 本物そっくり
+    let profiles = [Profile.load("profile.arrow"), Profile.load("profile.circle"), Profile.load("profile.mirror")]
+    var shape = UserDefaults.standard.object(forKey: "shape") as? Int ?? (UserDefaults.standard.bool(forKey: "circle") ? 1 : 0)
+    var lastCursor: NSCursor?
     var cur: Profile { profiles[shape] }
     var arrowView: ArrowView? { overlay.contentView as? ArrowView }
 
@@ -252,6 +269,8 @@ final class App: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ n: Notification) {
         _ = CGSSetConnectionProperty(CGSMainConnectionID(), CGSMainConnectionID(), "SetsCursorInBackground" as CFString, kCFBooleanTrue)
+        // 本物そっくりモードの初期サイズは 2 倍(本物と同じ大きさでは小さいので)
+        if UserDefaults.standard.dictionary(forKey: "profile.mirror") == nil { profiles[2].scale = 2 }
 
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         item.button?.image = NSImage(systemSymbolName: "cursorarrow", accessibilityDescription: "AlwaysCursor")
@@ -298,6 +317,7 @@ final class App: NSObject, NSApplicationDelegate {
 
     @objc func cmdTick() {
         checkCommand()
+        updateMirrorCursor()
         // Mission Control の検出は少し間引いて確認する(約5回/秒)
         if hideDuringMC || mcActive {
             mcPollCount += 1
@@ -459,21 +479,35 @@ final class App: NSObject, NSApplicationDelegate {
     func applyShape() {
         guard let v = arrowView else { return }
         v.circle = shape == 1
+        v.mirror = shape == 2
         v.profile = cur
         overlay.alphaValue = cur.opacity
+        if shape == 2 { lastCursor = nil; updateMirrorCursor() }
     }
     /// 見た目が変わったときの共通処理(反映して保存)
     func profileChanged() {
         arrowView?.refresh()
         overlay.alphaValue = cur.opacity
-        cur.save(shape == 1 ? "profile.circle" : "profile.arrow")
+        cur.save(["profile.arrow", "profile.circle", "profile.mirror"][shape])
     }
 
     @objc func shapeChanged(_ c: NSSegmentedControl) {
         shape = c.selectedSegment
+        UserDefaults.standard.set(shape, forKey: "shape")
         UserDefaults.standard.set(shape == 1, forKey: "circle")
         applyShape()
         refreshControls()
+    }
+
+    /// 本物そっくりモード用: いま表示されている本物のカーソルを取り込んで描き替える
+    func updateMirrorCursor() {
+        guard shape == 2, let v = arrowView else { return }
+        let c = NSCursor.currentSystem ?? NSCursor.arrow
+        if c !== lastCursor {
+            lastCursor = c
+            v.mirrorImage = c.image
+            v.mirrorHotSpot = c.hotSpot
+        }
     }
 
     /// 選んでいる形の設定値を設定画面に表示する
@@ -534,8 +568,8 @@ final class App: NSObject, NSApplicationDelegate {
         guard panel.runModal() == .OK, let url = panel.url else { return }
         let obj: [String: Any] = [
             "app": "AlwaysCursor", "version": 1,
-            "shape": shape == 1 ? "circle" : "arrow",
-            "profiles": ["arrow": profiles[0].exported(), "circle": profiles[1].exported()],
+            "shape": shape == 2 ? "mirror" : (shape == 1 ? "circle" : "arrow"),
+            "profiles": ["arrow": profiles[0].exported(), "circle": profiles[1].exported(), "mirror": profiles[2].exported()],
             "follow": ["leadMs": Double(lead) * 1000, "smooth": Double(smooth), "stopMs": stopDelay * 1000],
             "ripple": ["on": rippleOn, "radius": Double(rippleRadius), "color": Prefs.rgba(rippleColor)],
         ]
@@ -559,9 +593,14 @@ final class App: NSObject, NSApplicationDelegate {
             if let p = obj["profiles"] as? [String: Any] {
                 if let a = p["arrow"] as? [String: Any] { profiles[0].apply(a) }
                 if let c = p["circle"] as? [String: Any] { profiles[1].apply(c) }
+                if let m = p["mirror"] as? [String: Any] { profiles[2].apply(m) }
             }
-            profiles[0].save("profile.arrow"); profiles[1].save("profile.circle")
-            if let sh = obj["shape"] as? String { shape = sh == "circle" ? 1 : 0; UserDefaults.standard.set(shape == 1, forKey: "circle") }
+            profiles[0].save("profile.arrow"); profiles[1].save("profile.circle"); profiles[2].save("profile.mirror")
+            if let sh = obj["shape"] as? String {
+                shape = sh == "mirror" ? 2 : (sh == "circle" ? 1 : 0)
+                UserDefaults.standard.set(shape, forKey: "shape")
+                UserDefaults.standard.set(shape == 1, forKey: "circle")
+            }
             if let f = obj["follow"] as? [String: Any], followRows.count == 3 {
                 if let v = f["leadMs"] as? Double { followRows[0].set(min(max(v, 0), 40)) }
                 if let v = f["smooth"] as? Double { followRows[1].set(min(max(v, 0), 0.9)) }
@@ -625,7 +664,7 @@ final class App: NSObject, NSApplicationDelegate {
             }
 
             // 形
-            shapeControl = NSSegmentedControl(labels: ["矢印", "丸"], trackingMode: .selectOne, target: self, action: #selector(shapeChanged(_:)))
+            shapeControl = NSSegmentedControl(labels: ["矢印", "丸", "本物"], trackingMode: .selectOne, target: self, action: #selector(shapeChanged(_:)))
             let shapeRow = NSStackView(views: [NSTextField(labelWithString: "形"), shapeControl]); shapeRow.spacing = 10
             let shapeNote = NSTextField(labelWithString: "以下の設定は、選んでいる形ごとに別々に保存されます")
             shapeNote.font = .systemFont(ofSize: NSFont.smallSystemFontSize); shapeNote.textColor = .secondaryLabelColor
