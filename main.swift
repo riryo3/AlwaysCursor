@@ -244,6 +244,12 @@ final class App: NSObject, NSApplicationDelegate {
     var cmdClean = false
     var rippleCheck: NSButton!, rippleSwatch: SwatchView!, rippleRow: ParamRow!
 
+    // Mission Control / アプリケーション Exposé の間は隠す(任意設定)
+    var hideDuringMC = UserDefaults.standard.bool(forKey: "hideDuringMC")
+    var mcActive = false
+    var mcPollCount = 0
+    var mcCheck: NSButton!
+
     func applicationDidFinishLaunching(_ n: Notification) {
         _ = CGSSetConnectionProperty(CGSMainConnectionID(), CGSMainConnectionID(), "SetsCursorInBackground" as CFString, kCFBooleanTrue)
 
@@ -290,7 +296,50 @@ final class App: NSObject, NSApplicationDelegate {
 
     // MARK: 追従
 
-    @objc func cmdTick() { checkCommand() }
+    @objc func cmdTick() {
+        checkCommand()
+        // Mission Control の検出は少し間引いて確認する(約5回/秒)
+        if hideDuringMC || mcActive {
+            mcPollCount += 1
+            if mcPollCount >= 6 { mcPollCount = 0; checkMissionControl() }
+        }
+    }
+
+    /// Mission Control / アプリケーション Exposé が表示中かどうか
+    /// 公式の判定方法は無いので、Dock が画面全体サイズのウィンドウを出しているかで推定する
+    func missionControlActive() -> Bool {
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return false }
+        for w in list {
+            guard (w[kCGWindowOwnerName as String] as? String) == "Dock",
+                  let b = w[kCGWindowBounds as String] as? [String: Any],
+                  let sw = (b["Width"] as? NSNumber)?.doubleValue,
+                  let sh = (b["Height"] as? NSNumber)?.doubleValue else { continue }
+            for s in NSScreen.screens where sw >= Double(s.frame.width) * 0.9 && sh >= Double(s.frame.height) * 0.9 { return true }
+        }
+        return false
+    }
+
+    func checkMissionControl() {
+        let active = missionControlActive()
+        guard active != mcActive else { return }
+        mcActive = active
+        if active {
+            overlay.orderOut(nil)
+            rippleWindow?.orderOut(nil)
+        } else {
+            // 戻ってきたら現在位置から追従を再開する
+            lastOrigin = NSPoint(x: -99999, y: -99999)
+            lastPos = NSEvent.mouseLocation; lastTime = CACurrentMediaTime(); velocity = .zero
+            follow()
+        }
+    }
+
+    @objc func mcToggled(_ b: NSButton) {
+        hideDuringMC = b.state == .on
+        UserDefaults.standard.set(hideDuringMC, forKey: "hideDuringMC")
+        if hideDuringMC { checkMissionControl() }
+        else if mcActive { mcActive = false; lastOrigin = NSPoint(x: -99999, y: -99999); follow() }
+    }
 
     /// 画面更新への同期は、動いている間だけ働かせる(止まっている間は休ませて電力を節約)
     func wake() {
@@ -387,7 +436,7 @@ final class App: NSObject, NSApplicationDelegate {
             velocity = .zero            // 止まったら先読みをやめる(行き過ぎ防止)
         }
         let target = NSPoint(x: p.x + velocity.x * lead, y: p.y + velocity.y * lead)
-        if showArrow {
+        if showArrow && !mcActive {
             let o = NSPoint(x: (target.x - S/2).rounded(), y: (target.y - S/2).rounded())
             if o != lastOrigin { overlay.setFrameOrigin(o); lastOrigin = o }
             if !overlay.isVisible { overlay.orderFrontRegardless() }
@@ -632,13 +681,16 @@ final class App: NSObject, NSApplicationDelegate {
             let login = NSButton(checkboxWithTitle: "ログイン時に自動で起動", target: self, action: #selector(loginChanged(_:)))
             login.state = SMAppService.mainApp.status == .enabled ? .on : .off
 
+            mcCheck = NSButton(checkboxWithTitle: "Mission Control / アプリケーション Exposé の表示中は隠す", target: self, action: #selector(mcToggled(_:)))
+            mcCheck.state = hideDuringMC ? .on : .off
+
             let rows: [NSView] = [
                 header("形"), shapeRow, shapeNote,
                 header("見た目(選んだ形の設定)"), sizeRow.stack, colorRow, widthRow.stack, blurRow.stack, opacityRow.stack,
                 header("追従の調整(全体共通 / 先読み 0 = なし)"), leadRow.stack, smoothRow.stack, stopRow.stack, resetFollow,
                 header("波紋(全体共通)"), rippleTop, rippleRow.stack,
                 header("設定の引っ越し(JSON)"), moveRow,
-                login,
+                login, mcCheck,
             ]
             let stack = NSStackView(views: rows)
             stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 10
